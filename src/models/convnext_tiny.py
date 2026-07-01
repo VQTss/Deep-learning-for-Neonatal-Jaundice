@@ -9,7 +9,7 @@ class ConvNeXtTinyRegression(nn.Module):
     def __init__(self, pretrained: bool = True):
         super().__init__()
         print(f"ConvNeXt-Tiny - Pretrain: {pretrained}")
-        weights = ConvNeXt_Tiny_Weights.DEFAULT if pretrained else None
+        weights = ConvNeXt_Tiny_Weights.IMAGENET1K_V1 if pretrained else None
         backbone = models.convnext_tiny(weights=weights)
         self.features = nn.Sequential(
             backbone.features,

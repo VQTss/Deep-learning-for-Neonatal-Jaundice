@@ -9,7 +9,7 @@ class ResNetRegression(nn.Module):
     def __init__(self, pretrained: bool = True):
         super().__init__()
         print(f"Model:ResNet-18 - Pretrain: {pretrained}")
-        weights = ResNet18_Weights.DEFAULT if pretrained else None
+        weights = ResNet18_Weights.IMAGENET1K_V1 if pretrained else None
         backbone = models.resnet18(weights=weights)
         self.features = nn.Sequential(*list(backbone.children())[:-1])
         self.fc = nn.Linear(512, 1)

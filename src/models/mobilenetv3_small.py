@@ -9,7 +9,7 @@ class MobileNetV3SmallRegression(nn.Module):
     def __init__(self, pretrained: bool = True):
         super().__init__()
         print(f"MobileNetV3-Small - Pretrain: {pretrained}")
-        weights = MobileNet_V3_Small_Weights.DEFAULT if pretrained else None
+        weights = MobileNet_V3_Small_Weights.IMAGENET1K_V1 if pretrained else None
         backbone = models.mobilenet_v3_small(weights=weights)
         self.features = nn.Sequential(
             backbone.features,
