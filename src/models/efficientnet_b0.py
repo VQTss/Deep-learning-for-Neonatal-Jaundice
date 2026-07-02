@@ -9,7 +9,7 @@ class EfficientNetB0Regression(nn.Module):
     def __init__(self, pretrained: bool = True):
         super().__init__()
         print(f"EfficientNet-B0 - Pretrain: {pretrained}")
-        weights = EfficientNet_B0_Weights.DEFAULT if pretrained else None
+        weights = EfficientNet_B0_Weights.IMAGENET1K_V1 if pretrained else None
         backbone = models.efficientnet_b0(weights=weights)
         self.features = nn.Sequential(
             backbone.features,
