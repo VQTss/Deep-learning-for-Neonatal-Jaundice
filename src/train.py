@@ -1,6 +1,7 @@
 import os
 import time
 import random
+import json
 import numpy as np
 import pandas as pd
 import torch
@@ -59,9 +60,43 @@ def compute_metrics(preds, targets):
     }
 
 
+# ==================== Optimizer & Warmup ====================
+
+def build_optimizer(model, cfg, pretrained: bool):
+    """Differential LR cho backbone (features) và head (fc), tách weight decay khỏi BN/bias."""
+    lr_backbone = cfg.lr_backbone if pretrained else cfg.lr_backbone_scratch
+
+    backbone_decay, backbone_no_decay, head_params = [], [], []
+    for name, p in model.named_parameters():
+        if not p.requires_grad:
+            continue
+        if name.startswith("fc."):
+            head_params.append(p)
+        elif p.ndim == 1 or "bn" in name.lower():
+            backbone_no_decay.append(p)
+        else:
+            backbone_decay.append(p)
+
+    param_groups = [
+        {"params": backbone_decay,    "lr": lr_backbone, "weight_decay": cfg.weight_decay},
+        {"params": backbone_no_decay,  "lr": lr_backbone, "weight_decay": 0.0},
+        {"params": head_params,        "lr": cfg.lr_head, "weight_decay": cfg.weight_decay},
+    ]
+    return torch.optim.AdamW(param_groups)
+
+
+def linear_warmup_lr(optimizer, epoch_idx: int, warmup_epochs: int, base_lrs):
+    """Warmup thủ công, tương thích với ReduceLROnPlateau (gọi theo epoch)."""
+    if warmup_epochs <= 0 or epoch_idx >= warmup_epochs:
+        return
+    scale = (epoch_idx + 1) / warmup_epochs
+    for group, base_lr in zip(optimizer.param_groups, base_lrs):
+        group["lr"] = base_lr * scale
+
+
 # ==================== Training Loop ====================
 
-def train_one_epoch(model, loader, optimizer, criterion, scaler, device, use_amp: bool = True):
+def train_one_epoch(model, loader, optimizer, criterion, scaler, device, use_amp: bool = True, grad_clip_norm: float = 1.0):
     model.train()
     total_loss = 0.0
     all_preds, all_targets = [], []
@@ -78,12 +113,15 @@ def train_one_epoch(model, loader, optimizer, criterion, scaler, device, use_amp
                 outputs = model(images)
                 loss = criterion(outputs, targets)
             scaler.scale(loss).backward()
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=grad_clip_norm)
             scaler.step(optimizer)
             scaler.update()
         else:
             outputs = model(images)
             loss = criterion(outputs, targets)
             loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=grad_clip_norm)
             optimizer.step()
 
         total_loss += loss.item()
@@ -187,7 +225,6 @@ def test_fold(cfg: Config, fold: int, device: torch.device, logger):
 
     logger.info(f"Test Loss: {avg_loss:.4f}")
     logger.info(f"Test MAE: {metrics['mae']:.4f}")
-    logger.info(f"Test MSE: {metrics['mse']:.4f}")
     logger.info(f"Test RMSE: {metrics['rmse']:.4f}")
     logger.info(f"Test R2: {metrics['r2']:.4f}")
 
@@ -201,31 +238,7 @@ def test_fold(cfg: Config, fold: int, device: torch.device, logger):
     }
 
 
-def test_all_folds(cfg: Config, device: torch.device, logger):
-    """Evaluate all folds on their test sets"""
-    logger.info(f"\n{'='*60}")
-    logger.info("TESTING ALL FOLDS")
-    logger.info(f"{'='*60}")
-
-    test_results = []
-    for fold in range(1, cfg.n_folds + 1):
-        result = test_fold(cfg, fold, device, logger)
-        if result:
-            test_results.append(result)
-
-    # Summary
-    df_results = pd.DataFrame(test_results)
-    logger.info(f"\n{'='*60}")
-    logger.info("TEST SUMMARY")
-    logger.info(f"{'='*60}")
-    logger.info(f"\n{df_results.to_string(index=False)}")
-
-    mean_mae = df_results["mae"].mean()
-    mean_rmse = df_results["rmse"].mean()
-    logger.info(f"\nMean Test MAE: {mean_mae:.4f}")
-    logger.info(f"Mean Test RMSE: {mean_rmse:.4f}")
-
-    return test_results
+# (test_all_folds đã được inline hóa trong main() để test ngay sau từng fold và cleanup CUDA memory.)
 
 
 # ==================== Main ====================
@@ -236,6 +249,17 @@ def train_fold(
     device: torch.device,
     logger
 ):
+    # Resume: skip fold nếu đã có result JSON (đã train xong lần trước)
+    result_path = os.path.join(cfg.output_dir, f"fold{fold:02d}_result.json")
+    if os.path.exists(result_path):
+        with open(result_path) as f:
+            saved = json.load(f)
+        logger.info(f"{'='*50}")
+        logger.info(f"Training Fold {fold}/{cfg.n_folds}")
+        logger.info(f"{'='*50}")
+        logger.info(f"  ↳ Skip fold {fold} (result exists): val_loss={saved['val_loss']:.4f}, best_epoch={saved['best_epoch']}")
+        return saved["val_loss"], saved["best_epoch"]
+
     logger.info(f"{'='*50}")
     logger.info(f"Training Fold {fold}/{cfg.n_folds}")
     logger.info(f"{'='*50}")
@@ -280,12 +304,9 @@ def train_fold(
     # Loss
     criterion = losses_function(cfg.loss_name, beta=cfg.loss_beta)
 
-    # Optimizer
-    optimizer = torch.optim.AdamW(
-        model.parameters(),
-        lr=cfg.lr,
-        weight_decay=cfg.weight_decay
-    )
+    # Optimizer (differential LR: backbone vs head)
+    optimizer = build_optimizer(model, cfg, cfg.pretrained)
+    base_lrs = [g["lr"] for g in optimizer.param_groups]
 
     # Scheduler
     if cfg.scheduler_name == "plateau":
@@ -299,8 +320,9 @@ def train_fold(
         scheduler_kwargs = {"T_max": cfg.epochs, "eta_min": cfg.eta_min}
     scheduler = get_scheduler(optimizer, cfg.scheduler_name, **scheduler_kwargs)
 
-    # AMP Scaler
-    scaler = GradScaler(device.type) if cfg.use_amp else None
+    # AMP Scaler (guard khi không có CUDA để tránh GradScaler edge-case trên CPU)
+    use_amp_runtime = cfg.use_amp and torch.cuda.is_available()
+    scaler = GradScaler(device.type) if use_amp_runtime else None
 
     best_val_loss = float("inf")
     best_epoch = 0
@@ -309,16 +331,20 @@ def train_fold(
     for epoch in range(1, cfg.epochs + 1):
         start_time = time.time()
 
+        # Warmup thủ công (chỉ áp dụng cho các epoch đầu)
+        linear_warmup_lr(optimizer, epoch - 1, cfg.warmup_epochs, base_lrs)
+
         # Train
         train_loss, train_metrics = train_one_epoch(
-            model, train_loader, optimizer, criterion, scaler, device, cfg.use_amp
+            model, train_loader, optimizer, criterion, scaler, device,
+            use_amp_runtime, cfg.grad_clip_norm
         )
 
         # Validate
         val_loss, val_metrics = validate(model, val_loader, criterion, device)
 
-        # Scheduler step
-        if scheduler is not None:
+        # Scheduler step (chỉ sau khi hết warmup)
+        if scheduler is not None and epoch > cfg.warmup_epochs:
             if cfg.scheduler_name == "plateau":
                 scheduler.step(val_loss)
             else:
@@ -326,12 +352,13 @@ def train_fold(
 
         elapsed = time.time() - start_time
 
-        # Current LR
-        current_lr = optimizer.param_groups[0]["lr"]
+        # Current LR (lấy LR của cả 3 group — đặc biệt hữu ích khi Plateau giảm LR đồng bộ)
+        lr_bb = optimizer.param_groups[0]["lr"]
+        lr_head = optimizer.param_groups[2]["lr"]
 
         # Log
         logger.info(
-            f"Epoch {epoch}/{cfg.epochs} | LR: {current_lr:.2e} | "
+            f"Epoch {epoch}/{cfg.epochs} | LR_bb: {lr_bb:.2e} | LR_head: {lr_head:.2e} | "
             f"Train Loss: {train_loss:.4f} | Val Loss: {val_loss:.4f} | "
             f"Val MAE: {val_metrics['mae']:.4f} | Val RMSE: {val_metrics['rmse']:.4f} | "
             f"Val R2: {val_metrics['r2']:.4f} | Time: {elapsed:.1f}s"
@@ -363,6 +390,10 @@ def train_fold(
                 break
 
     logger.info(f"Fold {fold} Complete - Best Epoch: {best_epoch}, Best Val Loss: {best_val_loss:.4f}")
+
+    # Lưu result JSON để lần chạy sau có thể skip
+    with open(result_path, "w") as f:
+        json.dump({"fold": fold, "val_loss": best_val_loss, "best_epoch": best_epoch}, f)
 
     return best_val_loss, best_epoch
 
@@ -397,6 +428,10 @@ def main():
     cfg.data_csv = resolve_project_path(cfg.data_csv, base=cfg.data_path)
     cfg.data_image = resolve_project_path(cfg.data_image, base=cfg.data_path)
 
+    # Verify data paths tồn tại NGAY SAU khi resolve (fail sớm trước khi tạo output dirs)
+    assert os.path.exists(cfg.data_csv), f"CSV not found: {cfg.data_csv}"
+    assert os.path.isdir(cfg.data_image), f"Image dir not found: {cfg.data_image}"
+
     # Output dirs: checkpoint/Regression/{model_name}_{pretrain_mode}/
     pretrain_tag = "pretrain" if cfg.pretrained else "scratch"
     cfg.output_dir = f"checkpoint/Regression/{cfg.model_name}_{pretrain_tag}"
@@ -408,16 +443,9 @@ def main():
     os.makedirs(cfg.log_dir, exist_ok=True)
     os.makedirs(cfg.plot_dir, exist_ok=True)
 
-    # Logger (khởi tạo trước để có thể log LR adjustment)
+    # Logger (khởi tạo trước để có thể log)
     log_file = os.path.join(cfg.log_dir, f"train_{time.strftime('%Y%m%d_%H%M%S')}.log")
     logger = get_logger("train", level="INFO", log_file=log_file)
-
-    # Auto-adjust LR cho từng model family (EfficientNet cần LR thấp hơn)
-    if cfg.model_name.startswith("efficientnet"):
-        if cfg.lr >= 1e-3:  # Chỉ hạ nếu đang dùng LR mặc định cao
-            original_lr = cfg.lr
-            cfg.lr = 5e-5   # EfficientNet: LR thấp hơn để ổn định hơn
-            logger.info(f"  [Auto] LR adjusted: {original_lr} -> {cfg.lr} (model={cfg.model_name})")
 
     # Config summary
     logger.info("=" * 60)
@@ -428,12 +456,14 @@ def main():
     logger.info(f"  K-fold:       {cfg.n_folds}")
     logger.info(f"  Epochs:       {cfg.epochs}")
     logger.info(f"  Batch size:   {cfg.batch_size}")
-    logger.info(f"  LR:           {cfg.lr} (decayed by {cfg.scheduler_name})")
+    logger.info(f"  LR (backbone): {cfg.lr_backbone} | LR (head): {cfg.lr_head} (decayed by {cfg.scheduler_name})")
     logger.info(f"  Optimizer:    AdamW (weight_decay={cfg.weight_decay})")
     logger.info(f"  Loss:         {cfg.loss_name}")
     logger.info(f"  Scheduler:    {cfg.scheduler_name}")
     if cfg.scheduler_name == "plateau":
         logger.info(f"    - patience: {cfg.plateau_patience}, factor: {cfg.plateau_factor}, min_lr: {cfg.plateau_min_lr}")
+    logger.info(f"  Warmup:       {cfg.warmup_epochs} epochs (manual)")
+    logger.info(f"  Grad clip:    max_norm={cfg.grad_clip_norm}")
     logger.info(f"  Early stop:   {cfg.early_stopping} (patience={cfg.patience})")
     logger.info(f"  AMP:          {cfg.use_amp}")
     logger.info(f"  Seed:         {cfg.seed}")
