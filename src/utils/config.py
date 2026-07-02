@@ -9,7 +9,7 @@ class Config:
     pretrained: bool = True
 
     # ==================== Loss ====================
-    loss_name: str = "mse"                 # smoothl1 (huber), mse, l1 (mae)
+    loss_name: str = "smoothl1"             # smoothl1 (huber), mse, l1 (mae)
     loss_beta: float = 1.0                # chỉ dùng cho huber/smoothl1
 
     # ==================== Scheduler ====================
@@ -19,7 +19,7 @@ class Config:
     step_size: int = 10                   # Dùng cho StepLR
     gamma: float = 0.1                    # Hệ số giảm learning rate
     # ReduceLROnPlateau
-    plateau_patience: int = 5            # epochs không cải thiện trước khi giảm LR
+    plateau_patience: int = 3            # epochs không cải thiện trước khi giảm LR
     plateau_factor: float = 0.5           # nhân LR khi plateau
     plateau_min_lr: float = 1e-6          # LR tối thiểu
 
@@ -27,11 +27,16 @@ class Config:
     epochs: int = 100
     batch_size: int = 32
     lr: float = 1e-4
+    lr_backbone: float = 5e-5             # LR cho backbone khi pretrained=True
+    lr_backbone_scratch: float = 1e-4    # LR cho backbone khi pretrained=False
+    lr_head: float = 5e-4                 # LR cho lớp FC cuối (luôn train từ đầu)
     weight_decay: float = 1e-4
     num_workers: int = 4
     use_amp: bool = True
     early_stopping: bool = True
     patience: int = 10
+    warmup_epochs: int = 3                # warmup thủ công cho optimizer
+    grad_clip_norm: float = 1.0           # gradient clipping max_norm
 
     # ==================== Data ====================
     data_path: str = "../datasets"
@@ -57,7 +62,7 @@ def get_config() -> Config:
     parser.add_argument("--pretrained", type=lambda x: str(x).lower() == "true", default=True)
 
     # Loss
-    parser.add_argument("--loss_name", type=str, default="mse")
+    parser.add_argument("--loss_name", type=str, default="smoothl1")
     parser.add_argument("--loss_beta", type=float, default=1.0)
 
     # Scheduler
@@ -69,11 +74,17 @@ def get_config() -> Config:
     parser.add_argument("--epochs", type=int, default=100)
     parser.add_argument("--batch_size", type=int, default=32)
     parser.add_argument("--lr", type=float, default=1e-4)
+    parser.add_argument("--lr_backbone", type=float, default=5e-5)
+    parser.add_argument("--lr_backbone_scratch", type=float, default=1e-4)
+    parser.add_argument("--lr_head", type=float, default=5e-4)
+    parser.add_argument("--weight_decay", type=float, default=1e-4)
     parser.add_argument("--early_stopping", type=lambda x: str(x).lower() == "true", default=True)
     parser.add_argument("--patience", type=int, default=10)
+    parser.add_argument("--warmup_epochs", type=int, default=3)
+    parser.add_argument("--grad_clip_norm", type=float, default=1.0)
 
     # Scheduler (plateau)
-    parser.add_argument("--plateau_patience", type=int, default=5)
+    parser.add_argument("--plateau_patience", type=int, default=3)
     parser.add_argument("--plateau_factor", type=float, default=0.5)
     parser.add_argument("--plateau_min_lr", type=float, default=1e-6)
 
@@ -105,8 +116,14 @@ def get_config() -> Config:
         epochs=args.epochs,
         batch_size=args.batch_size,
         lr=args.lr,
+        lr_backbone=args.lr_backbone,
+        lr_backbone_scratch=args.lr_backbone_scratch,
+        lr_head=args.lr_head,
+        weight_decay=args.weight_decay,
         early_stopping=args.early_stopping,
         patience=args.patience,
+        warmup_epochs=args.warmup_epochs,
+        grad_clip_norm=args.grad_clip_norm,
         data_path=args.data_path,
         data_csv=args.data_csv,
         data_image=args.data_image,

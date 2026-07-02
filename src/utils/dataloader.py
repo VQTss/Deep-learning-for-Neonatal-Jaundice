@@ -10,23 +10,57 @@ from tqdm import tqdm
 # ==================== Helper Functions ====================
 
 def center_crop_roi(image: Image.Image, roi_size: int) -> Image.Image:
-    """Cắt vùng trung tâm ảnh thành hình vuông"""
-    width, height = image.size
-    left = (width - roi_size) // 2
-    top = (height - roi_size) // 2
-    right = left + roi_size
-    bottom = top + roi_size
+    """Cắt vùng trung tâm ảnh thành hình vuông. Zero-pad nếu ảnh nhỏ hơn roi_size."""
+    w, h = image.size
+    rs = roi_size
+
+    # Zero-pad nếu ảnh nhỏ hơn roi_size
+    pad_left = max(0, (rs - w) // 2)
+    pad_top = max(0, (rs - h) // 2)
+    pad_right = max(0, rs - w - pad_left)
+    pad_bottom = max(0, rs - h - pad_top)
+
+    if pad_left or pad_top or pad_right or pad_bottom:
+        new_img = Image.new(
+            "RGB",
+            (w + pad_left + pad_right, h + pad_top + pad_bottom),
+            (0, 0, 0),
+        )
+        new_img.paste(image, (pad_left, pad_top))
+        image = new_img
+        w, h = image.size
+
+    left = (w - rs) // 2
+    top = (h - rs) // 2
+    right = left + rs
+    bottom = top + rs
     return image.crop((left, top, right, bottom))
 
 
-def get_default_transform(image_size: int = 224):
-    """Transform mặc định cho ảnh ROI"""
+def get_train_transform(image_size: int = 224):
+    """Transform cho tập train — augmentation NHẸ, tránh phá vỡ tín hiệu màu da."""
     return transforms.Compose([
-        # transforms.Resize((image_size, image_size)),
+        transforms.RandomHorizontalFlip(p=0.5),
+        transforms.RandomRotation(degrees=10),
+        transforms.ColorJitter(brightness=0.1, contrast=0.1, saturation=0.05),
         transforms.ToTensor(),
         transforms.Normalize(mean=[0.485, 0.456, 0.406],
                              std=[0.229, 0.224, 0.225])
     ])
+
+
+def get_valid_transform(image_size: int = 224):
+    """Transform cho val/test — KHÔNG augment."""
+    return transforms.Compose([
+        transforms.ToTensor(),
+        transforms.Normalize(mean=[0.485, 0.456, 0.406],
+                             std=[0.229, 0.224, 0.225])
+    ])
+
+
+# Giữ lại tên cũ để tương thích ngược, nhưng trỏ về valid transform
+def get_default_transform(image_size: int = 224):
+    return get_valid_transform(image_size)
 
 
 # ==================== Dataset ====================
@@ -48,7 +82,15 @@ class NeonatalJaundiceDataset(Dataset):
     ):
         self.image_dir = image_dir
         self.roi_size = roi_size
-        self.transform = transform if transform else get_default_transform(roi_size)
+        self.split = split
+
+        # Tự động chọn augment transform nếu là train và transform=None
+        if transform is not None:
+            self.transform = transform
+        elif split == "train":
+            self.transform = get_train_transform(roi_size)
+        else:
+            self.transform = get_valid_transform(roi_size)
 
         df = pd.read_csv(csv_path)
 
@@ -107,7 +149,7 @@ def get_dataloader(
         roi_size=roi_size,
         split=split,
         fold=fold,
-        transform=get_default_transform(roi_size)
+        transform=None  # Để Dataset tự chọn transform theo split
     )
 
     return DataLoader(
@@ -219,13 +261,24 @@ def save_roi_for_fold(
 
         for _, row in tqdm(split_df.iterrows(), desc=f"[ROI] fold{fold:02d}/{split}", leave=False):
             img_path = os.path.join(image_dir, row["image_idx"])
+            dst_path = os.path.join(split_dir, os.path.basename(row["image_idx"]))
+
+            # Skip ROI extraction nếu file đã tồn tại (tránh lặp lại I/O khi train nhiều model)
+            if os.path.exists(dst_path):
+                saved_rows.append({
+                    "fold": fold,
+                    "split": split,
+                    "image_idx": row["image_idx"],
+                    "roi_path": dst_path,
+                    "label": row.get("blood(mg/dL)", None),
+                })
+                continue
+
             if not os.path.exists(img_path):
                 continue
 
             image = Image.open(img_path).convert("RGB")
             roi = center_crop_roi(image, roi_size)
-
-            dst_path = os.path.join(split_dir, os.path.basename(row["image_idx"]))
             roi.save(dst_path)
 
             saved_rows.append({
