@@ -41,7 +41,7 @@ class Config:
     # ==================== Data ====================
     data_path: str = "../datasets"
     data_csv: str = "split_10fold_blood.csv"           # relative to data_path
-    data_image: str = "images_wb_global"               # relative to data_path
+    data_image: str = "images_wb_median"               # relative to data_path
     image_size: int = 224
     n_folds: int = 10
 
@@ -91,7 +91,7 @@ def get_config() -> Config:
     # Data
     parser.add_argument("--data_path", type=str, default="./datasets")
     parser.add_argument("--data_csv", type=str, default="split_10fold_blood.csv")
-    parser.add_argument("--data_image", type=str, default="images_wb_global")
+    parser.add_argument("--data_image", type=str, default="images_wb_median")
     parser.add_argument("--image_size", type=int, default=224)
     parser.add_argument("--n_folds", type=int, default=10)
 
