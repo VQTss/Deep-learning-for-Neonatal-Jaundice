@@ -43,6 +43,8 @@ PRETRAIN_MODES=("true" "false")
 KEEP_GOING=false
 GPU_ID=""
 FORCE_RERUN=false
+USE_FFT=false
+FFT_D0=30.0
 
 MASTER_LOG="$SCRIPT_DIR/run_all_$(date +%Y%m%d_%H%M%S).log"
 
@@ -69,6 +71,8 @@ Options:
   --gpu ID                     Chọn GPU cụ thể (VD: 0). Mặc định dùng GPU mặc định của hệ thống
   --keep-going                 Không dừng batch nếu 1 job lỗi, tiếp tục job tiếp theo
   --force-rerun                Bỏ qua cơ chế skip, chạy lại toàn bộ dù đã có kết quả
+  --use_fft BOOL               Bật FFT Gaussian low-pass denoise (true/false, default: $USE_FFT)
+  --fft_d0 FLOAT               Cutoff d0 cho FFT low-pass (default: $FFT_D0)
   --help                        Hiển thị hướng dẫn này
 
 Available models: ${MODEL_LIST[*]}
@@ -113,6 +117,8 @@ while [[ $# -gt 0 ]]; do
         --gpu) GPU_ID="$2"; shift 2 ;;
         --keep-going) KEEP_GOING=true; shift ;;
         --force-rerun) FORCE_RERUN=true; shift ;;
+        --use_fft) USE_FFT="$2"; shift 2 ;;
+        --fft_d0) FFT_D0="$2"; shift 2 ;;
         --help) print_usage; exit 0 ;;
         *) echo "Unknown option: $1"; print_usage; exit 1 ;;
     esac
@@ -132,7 +138,7 @@ log() {
 is_job_done() {
     local model="$1"
     local pretrain_tag="$2"
-    local out_dir="checkpoint/Regression/${model}_${pretrain_tag}"
+    local out_dir="checkpoint/Regression_v2/${model}_${pretrain_tag}"
     local count=0
     for ((f=1; f<=N_FOLDS; f++)); do
         printf -v fold_str "%02d" "$f"
@@ -161,6 +167,7 @@ log "  Pretrain modes:      ${PRETRAIN_MODES[*]}"
 log "  GPU:                 ${GPU_ID:-default}"
 log "  Keep going on error: $KEEP_GOING"
 log "  Force rerun:         $FORCE_RERUN"
+log "  FFT low-pass:        $USE_FFT (d0=$FFT_D0)"
 log "  Master log:          $MASTER_LOG"
 log "============================================================"
 
@@ -219,6 +226,8 @@ for MODEL in "${MODEL_LIST[@]}"; do
             --batch_size "$BATCH_SIZE" \
             --n_folds "$N_FOLDS" \
             --pretrained "$PRETRAIN" \
+            --use_fft "$USE_FFT" \
+            --fft_d0 "$FFT_D0" \
             2>&1 | tee "$JOB_LOG"
         JOB_EXIT_CODE=${PIPESTATUS[0]}
         set -e 2>/dev/null || true   # khôi phục (bash set -e không áp dụng cùng -o pipefail ở đây, giữ an toàn)

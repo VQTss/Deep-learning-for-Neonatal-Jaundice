@@ -10,7 +10,10 @@ from tqdm import tqdm
 from torch.amp import autocast, GradScaler
 
 from utils.config import Config, get_config
-from utils.dataloader import get_10fold_dataloaders, get_dataloader, get_fold_dataset_info, save_roi_for_fold
+from utils.dataloader import (
+    get_10fold_dataloaders, get_dataloader, get_fold_dataset_info, save_roi_for_fold,
+    precompute_fft_cache,
+)
 from utils.losses import losses_function
 from utils.scheduler import get_scheduler
 from utils.logger import get_logger
@@ -181,7 +184,10 @@ def test_fold(cfg: Config, fold: int, device: torch.device, logger):
         roi_size=cfg.image_size,
         batch_size=cfg.batch_size,
         shuffle=False,
-        num_workers=cfg.num_workers
+        num_workers=cfg.num_workers,
+        use_fft=cfg.use_fft,
+        fft_d0=cfg.fft_d0,
+        fft_cache_dir=getattr(cfg, "fft_cache_path", None),
     )
 
     # Load model
@@ -274,6 +280,8 @@ def train_fold(
         fold=fold,
         roi_size=cfg.image_size,
         output_root=roi_root,
+        use_fft=cfg.use_fft,
+        fft_d0=cfg.fft_d0,
     )
     logger.info(f"ROI saved for fold {fold:02d} -> {roi_root}/fold{fold:02d}")
     logger.info(
@@ -292,7 +300,10 @@ def train_fold(
         fold=fold,
         roi_size=cfg.image_size,
         batch_size=cfg.batch_size,
-        num_workers=cfg.num_workers
+        num_workers=cfg.num_workers,
+        use_fft=cfg.use_fft,
+        fft_d0=cfg.fft_d0,
+        fft_cache_dir=getattr(cfg, "fft_cache_path", None),
     )
     
     logger.info(f"========= Pretrain {cfg.pretrained} =========")
@@ -432,9 +443,23 @@ def main():
     assert os.path.exists(cfg.data_csv), f"CSV not found: {cfg.data_csv}"
     assert os.path.isdir(cfg.data_image), f"Image dir not found: {cfg.data_image}"
 
-    # Output dirs: checkpoint/Regression/{model_name}_{pretrain_mode}/
+    # Nếu bật FFT, gán đường dẫn cache nhưng CHƯA đổi data_image (để precompute đọc từ ảnh gốc)
+    if cfg.use_fft:
+        cfg.fft_cache_path = os.path.join(cfg.data_path, cfg.fft_cache_dir)
+        os.makedirs(cfg.fft_cache_path, exist_ok=True)
+    else:
+        cfg.fft_cache_path = None
+
+    # Output dirs: checkpoint/Regression_v2_128/{model}_{pretrain}/ cho non-FFT
+    #               checkpoint/Regression_v2_224/{model}_{pretrain}_fft_dN/ cho FFT
+    # Tách riêng 2 folder để dễ so sánh và không ghi đè kết quả cũ
     pretrain_tag = "pretrain" if cfg.pretrained else "scratch"
-    cfg.output_dir = f"checkpoint/Regression/{cfg.model_name}_{pretrain_tag}"
+    if cfg.use_fft:
+        root_dir = "checkpoint/Regression_v2_224"
+        cfg.output_dir = f"{root_dir}/{cfg.model_name}_{pretrain_tag}_fft_d{int(cfg.fft_d0)}"
+    else:
+        root_dir = "checkpoint/Regression_v2_128"
+        cfg.output_dir = f"{root_dir}/{cfg.model_name}_{pretrain_tag}"
     cfg.checkpoint_dir = os.path.join(cfg.output_dir, "checkpoints")
     cfg.log_dir = os.path.join(cfg.output_dir, "logs")
     cfg.plot_dir = os.path.join(cfg.output_dir, "plots")
@@ -443,9 +468,27 @@ def main():
     os.makedirs(cfg.log_dir, exist_ok=True)
     os.makedirs(cfg.plot_dir, exist_ok=True)
 
-    # Logger (khởi tạo trước để có thể log)
+    # Logger (khởi tạo trước khối FFT cache để có thể log)
     log_file = os.path.join(cfg.log_dir, f"train_{time.strftime('%Y%m%d_%H%M%S')}.log")
     logger = get_logger("train", level="INFO", log_file=log_file)
+
+    # Precompute FFT cache nếu bật (idempotent, skip nếu đã tồn tại)
+    if cfg.use_fft:
+        logger.info(f"Precomputing FFT cache -> {cfg.fft_cache_path} (d0={cfg.fft_d0})")
+        stats = precompute_fft_cache(
+            csv_path=cfg.data_csv,
+            image_dir=cfg.data_image,  # ở đây vẫn là images_wb_region (gốc)
+            cache_dir=cfg.fft_cache_path,
+            roi_size=cfg.image_size,
+            fft_d0=cfg.fft_d0,
+            n_folds=cfg.n_folds,
+        )
+        logger.info(
+            f"FFT cache done: total={stats['n_total']} processed={stats['n_processed']} "
+            f"skipped={stats['n_skipped']} missing={stats['n_missing']}"
+        )
+        # Sau khi cache xong, data_image sẽ dùng cache cho training
+        cfg.data_image = cfg.fft_cache_path
 
     # Config summary
     logger.info("=" * 60)
@@ -470,6 +513,8 @@ def main():
     logger.info(f"  Image size:   {cfg.image_size}")
     logger.info(f"  Data CSV:     {cfg.data_csv}")
     logger.info(f"  Data Image:  {cfg.data_image}")
+    logger.info(f"  FFT Low-pass: use={cfg.use_fft} d0={cfg.fft_d0}"
+                + (f" (cache: {cfg.fft_cache_path})" if cfg.use_fft else ""))
     logger.info(f"  Output dir:   {cfg.output_dir}")
     logger.info("=" * 60)
 

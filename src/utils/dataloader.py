@@ -1,4 +1,5 @@
 import os
+import numpy as np
 import pandas as pd
 from PIL import Image
 import torch
@@ -7,49 +8,64 @@ from torchvision import transforms
 from tqdm import tqdm
 
 
+# ==================== FFT Low-pass Denoise ====================
+
+def _gaussian_lowpass_mask(size: int, d0: float) -> np.ndarray:
+    """Tạo Gaussian low-pass mask kích thước size×size, cutoff d0 (pixels)."""
+    cy = cx = size // 2
+    yy, xx = np.mgrid[0:size, 0:size]
+    r = np.sqrt((yy - cy) ** 2 + (xx - cx) ** 2)
+    return np.exp(-(r ** 2) / (2.0 * d0 ** 2))
+
+
+def fft_lowpass_denoise_pil(image: Image.Image, d0: float = 30.0) -> Image.Image:
+    """Apply FFT Gaussian low-pass denoise lên PIL Image (RGB). Trả về PIL Image uint8."""
+    arr = np.array(image).astype(np.float64)
+    if arr.ndim == 2:
+        arr = np.stack([arr, arr, arr], axis=-1)
+    size = arr.shape[0]
+    H = _gaussian_lowpass_mask(size, d0)
+    clean = np.zeros_like(arr)
+    for c in range(arr.shape[-1]):
+        F = np.fft.fftshift(np.fft.fft2(arr[..., c]))
+        clean[..., c] = np.real(np.fft.ifft2(np.fft.ifftshift(F * H)))
+    return Image.fromarray(np.clip(clean, 0, 255).astype(np.uint8))
+
+
 # ==================== Helper Functions ====================
 
 def center_crop_roi(image: Image.Image, roi_size: int) -> Image.Image:
-    """Cắt vùng trung tâm ảnh thành hình vuông. Zero-pad nếu ảnh nhỏ hơn roi_size."""
+    """Cắt vùng trung tâm ảnh vuông roi_size×roi_size.
+
+    Yêu cầu: ảnh đầu vào phải đã vuông và kích thước >= roi_size.
+    Nếu ảnh nhỏ hơn roi_size sẽ raise ValueError (tránh zero-pad gây viền đen).
+    """
     w, h = image.size
-    rs = roi_size
+    if w != h:
+        raise ValueError(f"center_crop_roi: ảnh phải vuông, nhận {w}x{h}")
+    if w < roi_size:
+        raise ValueError(f"center_crop_roi: ảnh {w}x{w} < roi_size={roi_size}")
 
-    # Zero-pad nếu ảnh nhỏ hơn roi_size
-    pad_left = max(0, (rs - w) // 2)
-    pad_top = max(0, (rs - h) // 2)
-    pad_right = max(0, rs - w - pad_left)
-    pad_bottom = max(0, rs - h - pad_top)
-
-    if pad_left or pad_top or pad_right or pad_bottom:
-        new_img = Image.new(
-            "RGB",
-            (w + pad_left + pad_right, h + pad_top + pad_bottom),
-            (0, 0, 0),
-        )
-        new_img.paste(image, (pad_left, pad_top))
-        image = new_img
-        w, h = image.size
-
-    left = (w - rs) // 2
-    top = (h - rs) // 2
-    right = left + rs
-    bottom = top + rs
+    left = (w - roi_size) // 2
+    top = (h - roi_size) // 2
+    right = left + roi_size
+    bottom = top + roi_size
     return image.crop((left, top, right, bottom))
 
 
-def get_train_transform(image_size: int = 224):
+def get_train_transform(image_size: int = 128):
     """Transform cho tập train — augmentation NHẸ, tránh phá vỡ tín hiệu màu da."""
     return transforms.Compose([
         transforms.RandomHorizontalFlip(p=0.5),
         transforms.RandomRotation(degrees=10),
-        transforms.ColorJitter(brightness=0.1, contrast=0.1, saturation=0.05),
+        # transforms.ColorJitter(brightness=0.1, contrast=0.1, saturation=0.05),
         transforms.ToTensor(),
         transforms.Normalize(mean=[0.485, 0.456, 0.406],
                              std=[0.229, 0.224, 0.225])
     ])
 
 
-def get_valid_transform(image_size: int = 224):
+def get_valid_transform(image_size: int = 128):
     """Transform cho val/test — KHÔNG augment."""
     return transforms.Compose([
         transforms.ToTensor(),
@@ -59,7 +75,7 @@ def get_valid_transform(image_size: int = 224):
 
 
 # Giữ lại tên cũ để tương thích ngược, nhưng trỏ về valid transform
-def get_default_transform(image_size: int = 224):
+def get_default_transform(image_size: int = 128):
     return get_valid_transform(image_size)
 
 
@@ -75,14 +91,20 @@ class NeonatalJaundiceDataset(Dataset):
         self,
         csv_path: str,
         image_dir: str,
-        roi_size: int = 224,
+        roi_size: int = 128,
         split: str = None,
         fold: int = None,
-        transform=None
+        transform=None,
+        use_fft: bool = False,
+        fft_d0: float = 30.0,
+        fft_cache_dir: str = None,
     ):
         self.image_dir = image_dir
         self.roi_size = roi_size
         self.split = split
+        self.use_fft = use_fft
+        self.fft_d0 = fft_d0
+        self.fft_cache_dir = fft_cache_dir
 
         # Tự động chọn augment transform nếu là train và transform=None
         if transform is not None:
@@ -103,7 +125,8 @@ class NeonatalJaundiceDataset(Dataset):
             df = df[df["split"] == split]
 
         self.df = df.reset_index(drop=True)
-        print(f"[Dataset] Loaded {len(self.df)} samples | roi_size={roi_size} | split={split} | fold={fold}")
+        fft_tag = f" | use_fft={use_fft} d0={fft_d0}" if use_fft else ""
+        print(f"[Dataset] Loaded {len(self.df)} samples | roi_size={roi_size} | split={split} | fold={fold}{fft_tag}")
 
     def __len__(self):
         return len(self.df)
@@ -112,11 +135,22 @@ class NeonatalJaundiceDataset(Dataset):
         row = self.df.iloc[idx]
         img_path = os.path.join(self.image_dir, row["image_idx"])
 
-        # Load ảnh gốc
-        image = Image.open(img_path).convert("RGB")
-
-        # === Tự động cắt ROI trung tâm ===
-        image = center_crop_roi(image, self.roi_size)
+        # Nếu cache FFT tồn tại, đọc thẳng từ cache (nhanh)
+        if self.use_fft and self.fft_cache_dir:
+            cached_path = os.path.join(self.fft_cache_dir, row["image_idx"])
+            if os.path.exists(cached_path):
+                image = Image.open(cached_path).convert("RGB")
+            else:
+                # Fallback: compute on-the-fly
+                image = Image.open(img_path).convert("RGB")
+                image = center_crop_roi(image, self.roi_size)
+                image = fft_lowpass_denoise_pil(image, d0=self.fft_d0)
+        else:
+            # Load ảnh gốc và crop ROI
+            image = Image.open(img_path).convert("RGB")
+            image = center_crop_roi(image, self.roi_size)
+            if self.use_fft:
+                image = fft_lowpass_denoise_pil(image, d0=self.fft_d0)
 
         # Label (blood mg/dL)
         label = torch.tensor(row["blood(mg/dL)"], dtype=torch.float32)
@@ -138,7 +172,10 @@ def get_dataloader(
     batch_size: int = 32,
     shuffle: bool = True,
     num_workers: int = 4,
-    pin_memory: bool = True
+    pin_memory: bool = True,
+    use_fft: bool = False,
+    fft_d0: float = 30.0,
+    fft_cache_dir: str = None,
 ) -> DataLoader:
     """
     Tạo DataLoader với Auto Center ROI Crop.
@@ -149,7 +186,10 @@ def get_dataloader(
         roi_size=roi_size,
         split=split,
         fold=fold,
-        transform=None  # Để Dataset tự chọn transform theo split
+        transform=None,  # Để Dataset tự chọn transform theo split
+        use_fft=use_fft,
+        fft_d0=fft_d0,
+        fft_cache_dir=fft_cache_dir,
     )
 
     return DataLoader(
@@ -168,7 +208,10 @@ def get_10fold_dataloaders(
     fold: int,
     roi_size: int = 224,
     batch_size: int = 32,
-    num_workers: int = 4
+    num_workers: int = 4,
+    use_fft: bool = False,
+    fft_d0: float = 30.0,
+    fft_cache_dir: str = None,
 ):
     """
     Trả về train_loader và val_loader cho một fold cụ thể.
@@ -185,7 +228,10 @@ def get_10fold_dataloaders(
         batch_size=batch_size,
         shuffle=True,
         num_workers=num_workers,
-        pin_memory=False  # Tắt pin_memory để tránh CUDA crash giữa các fold
+        pin_memory=False,  # Tắt pin_memory để tránh CUDA crash giữa các fold
+        use_fft=use_fft,
+        fft_d0=fft_d0,
+        fft_cache_dir=fft_cache_dir,
     )
 
     val_loader = get_dataloader(
@@ -197,7 +243,10 @@ def get_10fold_dataloaders(
         batch_size=batch_size,
         shuffle=False,
         num_workers=num_workers,
-        pin_memory=False  # Tắt pin_memory để tránh CUDA crash giữa các fold
+        pin_memory=False,  # Tắt pin_memory để tránh CUDA crash giữa các fold
+        use_fft=use_fft,
+        fft_d0=fft_d0,
+        fft_cache_dir=fft_cache_dir,
     )
 
     return train_loader, val_loader
@@ -230,9 +279,13 @@ def save_roi_for_fold(
     roi_size: int,
     output_root: str,
     splits=("train", "val", "test"),
+    use_fft: bool = False,
+    fft_d0: float = 30.0,
 ):
     """
     Lưu ROI (center crop) của từng fold ra disk để kiểm tra trực quan.
+    Nếu use_fft=True, áp dụng FFT Gaussian low-pass trước khi lưu.
+
     Cấu trúc:
         output_root/
             foldXX/
@@ -279,6 +332,8 @@ def save_roi_for_fold(
 
             image = Image.open(img_path).convert("RGB")
             roi = center_crop_roi(image, roi_size)
+            if use_fft:
+                roi = fft_lowpass_denoise_pil(roi, d0=fft_d0)
             roi.save(dst_path)
 
             saved_rows.append({
@@ -295,10 +350,63 @@ def save_roi_for_fold(
 
     # Cập nhật manifest gộp
     all_manifest_path = os.path.join(output_root, "roi_manifest.csv")
-    if os.path.exists(all_manifest_path):
+    if os.path.exists(all_manifest_path) and os.path.getsize(all_manifest_path) > 0:
         prev = pd.read_csv(all_manifest_path)
         prev = prev[prev["fold"] != fold]
         manifest = pd.concat([prev, manifest], ignore_index=True)
     manifest.to_csv(all_manifest_path, index=False)
 
     return fold_df, fold_info
+
+
+def precompute_fft_cache(
+    csv_path: str,
+    image_dir: str,
+    cache_dir: str,
+    roi_size: int,
+    fft_d0: float = 30.0,
+    n_folds: int = 10,
+):
+    """
+    Precompute ROI đã áp dụng FFT Low-pass cho tất cả ảnh trong CSV,
+    lưu vào cache_dir/<image_idx>.
+
+    Skip nếu file cache đã tồn tại (idempotent, an toàn chạy lại).
+    Trả về dict thống kê: {n_total, n_skipped, n_processed, n_missing}.
+    """
+    os.makedirs(cache_dir, exist_ok=True)
+    df = pd.read_csv(csv_path)
+    # Lấy unique image_idx để tránh trùng
+    unique_imgs = df["image_idx"].drop_duplicates().tolist()
+
+    n_total = len(unique_imgs)
+    n_skipped = 0
+    n_processed = 0
+    n_missing = 0
+
+    for img_idx in tqdm(unique_imgs, desc=f"[FFT Cache d0={fft_d0}]", leave=False):
+        dst = os.path.join(cache_dir, img_idx)
+        if os.path.exists(dst):
+            n_skipped += 1
+            continue
+        src = os.path.join(image_dir, img_idx)
+        if not os.path.exists(src):
+            n_missing += 1
+            continue
+        try:
+            img = Image.open(src).convert("RGB")
+            roi = center_crop_roi(img, roi_size)
+            roi_fft = fft_lowpass_denoise_pil(roi, d0=fft_d0)
+            roi_fft.save(dst)
+            n_processed += 1
+        except Exception as e:
+            print(f"[WARN] Failed processing {img_idx}: {e}")
+            n_missing += 1
+
+    return {
+        "n_total": n_total,
+        "n_skipped": n_skipped,
+        "n_processed": n_processed,
+        "n_missing": n_missing,
+        "cache_dir": cache_dir,
+    }

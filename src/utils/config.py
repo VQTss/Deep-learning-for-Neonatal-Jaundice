@@ -42,8 +42,13 @@ class Config:
     data_path: str = "../datasets"
     data_csv: str = "split_10fold_blood.csv"           # relative to data_path
     data_image: str = "images_wb_median"               # relative to data_path
-    image_size: int = 224
+    image_size: int = 128
     n_folds: int = 10
+
+    # ==================== FFT Low-pass Denoise ====================
+    use_fft: bool = False                              # bật/tắt FFT denoise
+    fft_d0: float = 30.0                               # Gaussian low-pass cutoff (pixels)
+    fft_cache_dir: str = "images_wb_region_fft_d0_30"  # thư mục cache ROI đã FFT
 
     # ==================== Logging & Checkpoint ====================
     checkpoint_dir: str = "checkpoints"
@@ -95,6 +100,10 @@ def get_config() -> Config:
     parser.add_argument("--image_size", type=int, default=224)
     parser.add_argument("--n_folds", type=int, default=10)
 
+    # FFT Low-pass Denoise
+    parser.add_argument("--use_fft", type=lambda x: str(x).lower() == "true", default=False)
+    parser.add_argument("--fft_d0", type=float, default=30.0)
+
     # Misc
     parser.add_argument("--use_amp", type=lambda x: str(x).lower() == "true", default=True)
     parser.add_argument("--seed", type=int, default=42)
@@ -129,6 +138,8 @@ def get_config() -> Config:
         data_image=args.data_image,
         image_size=args.image_size,
         n_folds=args.n_folds,
+        use_fft=args.use_fft,
+        fft_d0=args.fft_d0,
         use_amp=args.use_amp,
         seed=args.seed,
     )
