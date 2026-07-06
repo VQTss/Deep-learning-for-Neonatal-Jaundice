@@ -17,7 +17,19 @@ from utils.logger import get_logger
 
 # ==================== Model Registry ====================
 
-def get_model(model_name: str, pretrained: bool = True) -> nn.Module:
+def get_color_space_args(cfg: Config):
+    """Trả về (color_space, spaces) từ cfg, dùng để truyền vào get_dataloader."""
+    if cfg.fusion_mode == "multibranch":
+        return cfg.color_space, cfg.spaces_combo.split("+")
+    return cfg.color_space, None
+
+
+def get_model(model_name: str, pretrained: bool = True, fusion_mode: str = "single", spaces: list = None) -> nn.Module:
+    if fusion_mode == "multibranch":
+        from models.multibranch import MultiBranchRegression
+        if spaces is None:
+            raise ValueError("fusion_mode='multibranch' yêu cầu spaces != None")
+        return MultiBranchRegression(spaces=spaces, backbone_name=model_name, pretrained=pretrained)
     if model_name == "resnet18":
         from models.resnet18 import ResNetRegression
         return ResNetRegression(pretrained=pretrained)
@@ -33,6 +45,10 @@ def get_model(model_name: str, pretrained: bool = True) -> nn.Module:
     elif model_name == "mobilenetv3_small":
         from models.mobilenetv3_small import MobileNetV3SmallRegression
         return MobileNetV3SmallRegression(pretrained=pretrained)
+    elif model_name == "cnn1d":
+        from models.cnn1d import CNN1DRegression
+        in_channels = 3  # single-branch RGB/HSV/LAB/YCbCr đều 3 channels
+        return CNN1DRegression(in_channels=in_channels, pretrained=pretrained)
     else:
         raise ValueError(f"Unknown model: {model_name}")
 
@@ -63,19 +79,40 @@ def compute_metrics(preds, targets):
 # ==================== Optimizer & Warmup ====================
 
 def build_optimizer(model, cfg, pretrained: bool):
-    """Differential LR cho backbone (features) và head (fc), tách weight decay khỏi BN/bias."""
+    """Differential LR cho backbone (features) và head (fc), tách weight decay khỏi BN/bias.
+
+    Hỗ trợ cả single-branch và multi-branch models:
+    - Single: backbone là 1 nn.Sequential, head là 1 nn.Linear (tên 'fc.')
+    - Multi-branch: backbone là nn.ModuleList[Sequential,...], head là nn.Sequential MLP
+      (tham số ở các layer Linear/Conv2d/BN, không có prefix 'fc.' nên dùng heuristic khác).
+    """
     lr_backbone = cfg.lr_backbone if pretrained else cfg.lr_backbone_scratch
 
     backbone_decay, backbone_no_decay, head_params = [], [], []
-    for name, p in model.named_parameters():
-        if not p.requires_grad:
-            continue
-        if name.startswith("fc."):
-            head_params.append(p)
-        elif p.ndim == 1 or "bn" in name.lower():
-            backbone_no_decay.append(p)
-        else:
-            backbone_decay.append(p)
+    is_multibranch = hasattr(model, "backbones") and hasattr(model, "head") and not hasattr(model, "fc")
+
+    if is_multibranch:
+        # Multi-branch: duyệt tất cả sub-backbones cho backbone params
+        for backbone in model.backbones:
+            for name, p in backbone.named_parameters():
+                if not p.requires_grad:
+                    continue
+                if p.ndim == 1 or "bn" in name.lower():
+                    backbone_no_decay.append(p)
+                else:
+                    backbone_decay.append(p)
+        head_params = [p for p in model.head.parameters() if p.requires_grad]
+    else:
+        # Single-branch: dùng heuristic 'fc.' prefix như cũ
+        for name, p in model.named_parameters():
+            if not p.requires_grad:
+                continue
+            if name.startswith("fc."):
+                head_params.append(p)
+            elif p.ndim == 1 or "bn" in name.lower():
+                backbone_no_decay.append(p)
+            else:
+                backbone_decay.append(p)
 
     param_groups = [
         {"params": backbone_decay,    "lr": lr_backbone, "weight_decay": cfg.weight_decay},
@@ -173,6 +210,7 @@ def test_fold(cfg: Config, fold: int, device: torch.device, logger):
     logger.info(f"{'='*50}")
 
     # Load test data
+    cs_color, cs_spaces = get_color_space_args(cfg)
     test_loader = get_dataloader(
         csv_path=cfg.data_csv,
         image_dir=cfg.data_image,
@@ -181,11 +219,14 @@ def test_fold(cfg: Config, fold: int, device: torch.device, logger):
         roi_size=cfg.image_size,
         batch_size=cfg.batch_size,
         shuffle=False,
-        num_workers=cfg.num_workers
+        num_workers=cfg.num_workers,
+        color_space=cs_color,
+        spaces=cs_spaces,
     )
 
     # Load model
-    model = get_model(cfg.model_name, pretrained=False)
+    model = get_model(cfg.model_name, pretrained=False, fusion_mode=cfg.fusion_mode,
+                      spaces=(cfg.spaces_combo.split("+") if cfg.fusion_mode == "multibranch" else None))
     model = model.to(device)
 
     # Load checkpoint
@@ -286,19 +327,23 @@ def train_fold(
     )
 
     # Data
+    cs_color, cs_spaces = get_color_space_args(cfg)
     train_loader, val_loader = get_10fold_dataloaders(
         csv_path=cfg.data_csv,
         image_dir=cfg.data_image,
         fold=fold,
         roi_size=cfg.image_size,
         batch_size=cfg.batch_size,
-        num_workers=cfg.num_workers
+        num_workers=cfg.num_workers,
+        color_space=cs_color,
+        spaces=cs_spaces,
     )
     
     logger.info(f"========= Pretrain {cfg.pretrained} =========")
 
     # Model
-    model = get_model(cfg.model_name, pretrained=cfg.pretrained)
+    model = get_model(cfg.model_name, pretrained=cfg.pretrained, fusion_mode=cfg.fusion_mode,
+                      spaces=(cfg.spaces_combo.split("+") if cfg.fusion_mode == "multibranch" else None))
     model = model.to(device)
 
     # Loss
@@ -432,9 +477,14 @@ def main():
     assert os.path.exists(cfg.data_csv), f"CSV not found: {cfg.data_csv}"
     assert os.path.isdir(cfg.data_image), f"Image dir not found: {cfg.data_image}"
 
-    # Output dirs: checkpoint/Regression/{model_name}_{pretrain_mode}/
+    # Output dirs: checkpoint/Regression/{model_name}_{pretrain_mode}[_{color_space}|_mb_{combo}]/
     pretrain_tag = "pretrain" if cfg.pretrained else "scratch"
-    cfg.output_dir = f"checkpoint/Regression/{cfg.model_name}_{pretrain_tag}"
+    if cfg.fusion_mode == "multibranch":
+        # Chuẩn hoá combo: thay '+' bằng '_' để tránh shell escape issues
+        combo_tag = cfg.spaces_combo.replace("+", "_")
+        cfg.output_dir = f"checkpoint/Regression/{cfg.model_name}_{pretrain_tag}_mb_{combo_tag}"
+    else:
+        cfg.output_dir = f"checkpoint/Regression/{cfg.model_name}_{pretrain_tag}_{cfg.color_space}"
     cfg.checkpoint_dir = os.path.join(cfg.output_dir, "checkpoints")
     cfg.log_dir = os.path.join(cfg.output_dir, "logs")
     cfg.plot_dir = os.path.join(cfg.output_dir, "plots")
@@ -452,6 +502,11 @@ def main():
     logger.info("CONFIG SUMMARY")
     logger.info("=" * 60)
     logger.info(f"  Model:        {cfg.model_name} (pretrained={cfg.pretrained})")
+    logger.info(f"  Fusion mode:  {cfg.fusion_mode}")
+    if cfg.fusion_mode == "multibranch":
+        logger.info(f"  Spaces combo: {cfg.spaces_combo}")
+    else:
+        logger.info(f"  Color space:  {cfg.color_space}")
     logger.info(f"  Task:         Regression")
     logger.info(f"  K-fold:       {cfg.n_folds}")
     logger.info(f"  Epochs:       {cfg.epochs}")
