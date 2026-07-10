@@ -44,11 +44,16 @@ class Config:
     data_image: str = "images_wb_median"               # relative to data_path
     image_size: int = 128
     n_folds: int = 10
+    split_mode: str = "10fold"          # "10fold" (CV y nguyên) | "holdout" (CV + final test_fixed)
 
     # ==================== FFT Low-pass Denoise ====================
     use_fft: bool = False                              # bật/tắt FFT denoise
     fft_d0: float = 30.0                               # Gaussian low-pass cutoff (pixels)
     fft_cache_dir: str = "images_wb_region_fft_d0_30"  # thư mục cache ROI đã FFT
+
+    # ==================== Output (overrides) ====================
+    output_root: str = ""          # nếu set, dùng làm root cho output/checkpoint/log/plot
+    run_tag: str = ""              # nếu set, append vào output_root
 
     # ==================== Logging & Checkpoint ====================
     checkpoint_dir: str = "checkpoints"
@@ -99,10 +104,21 @@ def get_config() -> Config:
     parser.add_argument("--data_image", type=str, default="images_wb_median")
     parser.add_argument("--image_size", type=int, default=224)
     parser.add_argument("--n_folds", type=int, default=10)
+    parser.add_argument("--split_mode", type=str, default="10fold",
+                        choices=["10fold", "holdout"],
+                        help="10fold: CV y nguyen (train+val+test xoay vong). "
+                             "holdout: CV tren 80%% pool + 1 final model tren 20%% test_fixed.")
 
     # FFT Low-pass Denoise
     parser.add_argument("--use_fft", type=lambda x: str(x).lower() == "true", default=False)
     parser.add_argument("--fft_d0", type=float, default=30.0)
+
+    # Output root (set non-empty để custom thay vì auto-derive từ image_size/fft)
+    parser.add_argument("--output_root", type=str, default="",
+                        help="Custom output root. Nếu rỗng -> auto-derive từ image_size & use_fft."
+                             " Set ví dụ: 'checkpoint/ROI_variants/roi128_fft_d30_convnext_tiny'.")
+    parser.add_argument("--run_tag", type=str, default="",
+                        help="Tag gắn vào cuối output_dir để tránh chồng chập (vd 'roi224_fft_d30_convnext_tiny').")
 
     # Misc
     parser.add_argument("--use_amp", type=lambda x: str(x).lower() == "true", default=True)
@@ -138,10 +154,13 @@ def get_config() -> Config:
         data_image=args.data_image,
         image_size=args.image_size,
         n_folds=args.n_folds,
+        split_mode=args.split_mode,
         use_fft=args.use_fft,
         fft_d0=args.fft_d0,
         use_amp=args.use_amp,
         seed=args.seed,
+        output_root=args.output_root,
+        run_tag=args.run_tag,
     )
     return config
 

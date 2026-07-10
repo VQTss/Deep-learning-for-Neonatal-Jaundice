@@ -116,12 +116,15 @@ class NeonatalJaundiceDataset(Dataset):
 
         df = pd.read_csv(csv_path)
 
-        # Lọc theo fold
+        # Lọc theo fold (fold=0 -> test_fixed trong holdout split)
         if fold is not None:
             df = df[df["fold"] == fold]
 
-        # Lọc theo split (train/val/test) - chỉ khi fold cũng được chỉ định
-        if split is not None and fold is not None:
+        # Lọc theo split (train/val/test/test_fixed)
+        # Tách riêng khỏi filter fold để hỗ trợ split="test_fixed" với fold=0
+        if split is not None:
+            if "split" not in df.columns:
+                raise ValueError(f"CSV '{csv_path}' missing 'split' column")
             df = df[df["split"] == split]
 
         self.df = df.reset_index(drop=True)
@@ -215,59 +218,311 @@ def get_10fold_dataloaders(
 ):
     """
     Trả về train_loader và val_loader cho một fold cụ thể.
-    Leave-Patient-Out CV:
-    - Train: fold == current_fold VÀ split == "train"
-    - Val: fold == current_fold VÀ split == "val"
+
+    2 chế độ (tự động detect):
+    - LONG-FORMAT (split_10fold_blood.csv):
+        Train: fold == current_fold VÀ split == "train"
+        Val:   fold == current_fold VÀ split == "val"
+        (Mỗi patient xuất hiện 10 lần, một cho mỗi fold)
+    - WIDE-FORMAT (split_holdout.csv):
+        Train: fold ∈ {1..10} AND fold != current_fold (lọc theo fold, không lọc split)
+        Val:   fold == current_fold (không lọc split)
+        (Mỗi patient xuất hiện 1 lần, split="train" placeholder cho pool)
+
+    Auto-detect: nếu CSV có cột "split" với giá trị {"train","val","test"} cho fold
+    hiện tại thì dùng long-format; ngược lại dùng wide-format.
     """
-    train_loader = get_dataloader(
-        csv_path=csv_path,
+    df_check = pd.read_csv(csv_path)
+    fold_df_check = df_check[df_check["fold"] == fold]
+    has_long_format = (
+        "split" in fold_df_check.columns
+        and (fold_df_check["split"] == "val").any()
+    )
+
+    if has_long_format:
+        # Long-format: filter chuẩn (train/val theo split)
+        train_loader = get_dataloader(
+            csv_path=csv_path,
+            image_dir=image_dir,
+            roi_size=roi_size,
+            split="train",
+            fold=fold,
+            batch_size=batch_size,
+            shuffle=True,
+            num_workers=num_workers,
+            pin_memory=False,
+            use_fft=use_fft,
+            fft_d0=fft_d0,
+            fft_cache_dir=fft_cache_dir,
+        )
+        val_loader = get_dataloader(
+            csv_path=csv_path,
+            image_dir=image_dir,
+            roi_size=roi_size,
+            split="val",
+            fold=fold,
+            batch_size=batch_size,
+            shuffle=False,
+            num_workers=num_workers,
+            pin_memory=False,
+            use_fft=use_fft,
+            fft_d0=fft_d0,
+            fft_cache_dir=fft_cache_dir,
+        )
+    else:
+        # Wide-format (holdout): filter theo fold (placeholder split="train" cho pool)
+        train_loader, val_loader = _get_wide_format_dataloaders(
+            csv_path=csv_path,
+            image_dir=image_dir,
+            fold=fold,
+            roi_size=roi_size,
+            batch_size=batch_size,
+            num_workers=num_workers,
+            use_fft=use_fft,
+            fft_d0=fft_d0,
+            fft_cache_dir=fft_cache_dir,
+        )
+
+    return train_loader, val_loader
+
+
+def _get_wide_format_dataloaders(
+    csv_path: str,
+    image_dir: str,
+    fold: int,
+    roi_size: int,
+    batch_size: int,
+    num_workers: int,
+    use_fft: bool,
+    fft_d0: float,
+    fft_cache_dir: str = None,
+):
+    """Wide-format (holdout CSV): filter theo fold thuần (split="train" placeholder)."""
+    from torch.utils.data import DataLoader, Dataset
+
+    df = pd.read_csv(csv_path)
+    pool_df = df[df["fold"].between(1, 10)].copy()
+
+    train_df = pool_df[pool_df["fold"] != fold]
+    val_df = pool_df[pool_df["fold"] == fold]
+
+    class _WideDataset(Dataset):
+        def __init__(self, df, image_dir, roi_size, transform, use_fft, fft_d0, fft_cache_dir):
+            self.df = df.reset_index(drop=True)
+            self.image_dir = image_dir
+            self.roi_size = roi_size
+            self.transform = transform
+            self.use_fft = use_fft
+            self.fft_d0 = fft_d0
+            self.fft_cache_dir = fft_cache_dir
+
+        def __len__(self):
+            return len(self.df)
+
+        def __getitem__(self, idx):
+            row = self.df.iloc[idx]
+            img_path = os.path.join(self.image_dir, row["image_idx"])
+            if self.use_fft and self.fft_cache_dir:
+                cached_path = os.path.join(self.fft_cache_dir, row["image_idx"])
+                if os.path.exists(cached_path):
+                    image = Image.open(cached_path).convert("RGB")
+                else:
+                    image = Image.open(img_path).convert("RGB")
+                    image = center_crop_roi(image, self.roi_size)
+                    if self.use_fft:
+                        image = fft_lowpass_denoise_pil(image, d0=self.fft_d0)
+            else:
+                image = Image.open(img_path).convert("RGB")
+                image = center_crop_roi(image, self.roi_size)
+                if self.use_fft:
+                    image = fft_lowpass_denoise_pil(image, d0=self.fft_d0)
+
+            label = torch.tensor(row["blood(mg/dL)"], dtype=torch.float32)
+            if self.transform:
+                image = self.transform(image)
+            return image, label
+
+    print(
+        f"[WideDataset/train] Loaded {len(train_df)} samples | roi_size={roi_size} | "
+        f"fold ∈ [1,10] \\ {fold}"
+    )
+    print(
+        f"[WideDataset/val]   Loaded {len(val_df)} samples | roi_size={roi_size} | fold={fold}"
+    )
+
+    train_dataset = _WideDataset(
+        train_df, image_dir, roi_size, get_train_transform(roi_size),
+        use_fft, fft_d0, fft_cache_dir,
+    )
+    val_dataset = _WideDataset(
+        val_df, image_dir, roi_size, get_valid_transform(roi_size),
+        use_fft, fft_d0, fft_cache_dir,
+    )
+
+    train_loader = DataLoader(
+        train_dataset, batch_size=batch_size, shuffle=True,
+        num_workers=num_workers, pin_memory=False, drop_last=True,
+    )
+    val_loader = DataLoader(
+        val_dataset, batch_size=batch_size, shuffle=False,
+        num_workers=num_workers, pin_memory=False, drop_last=False,
+    )
+    return train_loader, val_loader
+
+
+def get_pool_train_loader(
+    csv_path: str,
+    image_dir: str,
+    roi_size: int = 224,
+    batch_size: int = 32,
+    num_workers: int = 4,
+    use_fft: bool = False,
+    fft_d0: float = 30.0,
+    fft_cache_dir: str = None,
+):
+    """
+    Holdout workflow: trả về DataLoader gộp TOÀN BỘ pool rows
+    (fold ∈ {1..10}, split="train" placeholder) để train final model.
+
+    Không filter theo fold — dùng toàn bộ 80% pool làm training set.
+    """
+    import pandas as pd
+    from torch.utils.data import DataLoader, Dataset
+    from torchvision import transforms
+
+    df_full = pd.read_csv(csv_path)
+    pool_df = df_full[df_full["fold"].between(1, 10)].copy()
+
+    class _PoolDataset(Dataset):
+        def __init__(self, df, image_dir, roi_size, transform, use_fft, fft_d0, fft_cache_dir):
+            self.df = df.reset_index(drop=True)
+            self.image_dir = image_dir
+            self.roi_size = roi_size
+            self.transform = transform
+            self.use_fft = use_fft
+            self.fft_d0 = fft_d0
+            self.fft_cache_dir = fft_cache_dir
+
+        def __len__(self):
+            return len(self.df)
+
+        def __getitem__(self, idx):
+            row = self.df.iloc[idx]
+            img_path = os.path.join(self.image_dir, row["image_idx"])
+
+            if self.use_fft and self.fft_cache_dir:
+                cached_path = os.path.join(self.fft_cache_dir, row["image_idx"])
+                if os.path.exists(cached_path):
+                    image = Image.open(cached_path).convert("RGB")
+                else:
+                    image = Image.open(img_path).convert("RGB")
+                    image = center_crop_roi(image, self.roi_size)
+                    if self.use_fft:
+                        image = fft_lowpass_denoise_pil(image, d0=self.fft_d0)
+            else:
+                image = Image.open(img_path).convert("RGB")
+                image = center_crop_roi(image, self.roi_size)
+                if self.use_fft:
+                    image = fft_lowpass_denoise_pil(image, d0=self.fft_d0)
+
+            label = torch.tensor(row["blood(mg/dL)"], dtype=torch.float32)
+            if self.transform:
+                image = self.transform(image)
+            return image, label
+
+    print(
+        f"[PoolDataset] Loaded {len(pool_df)} samples | roi_size={roi_size} | "
+        f"pool rows (fold ∈ [1, {pool_df['fold'].max() if len(pool_df) else 10}])"
+    )
+
+    dataset = _PoolDataset(
+        df=pool_df,
         image_dir=image_dir,
         roi_size=roi_size,
-        split="train",
-        fold=fold,
+        transform=get_train_transform(roi_size),
+        use_fft=use_fft,
+        fft_d0=fft_d0,
+        fft_cache_dir=fft_cache_dir,
+    )
+    return DataLoader(
+        dataset,
         batch_size=batch_size,
         shuffle=True,
         num_workers=num_workers,
-        pin_memory=False,  # Tắt pin_memory để tránh CUDA crash giữa các fold
-        use_fft=use_fft,
-        fft_d0=fft_d0,
-        fft_cache_dir=fft_cache_dir,
+        pin_memory=False,
+        drop_last=True,
     )
 
-    val_loader = get_dataloader(
+
+def get_test_fixed_loader(
+    csv_path: str,
+    image_dir: str,
+    roi_size: int = 224,
+    batch_size: int = 32,
+    num_workers: int = 4,
+    use_fft: bool = False,
+    fft_d0: float = 30.0,
+    fft_cache_dir: str = None,
+):
+    """
+    Holdout workflow: trả về DataLoader cho test_fixed (fold=0, split=test_fixed).
+    """
+    return get_dataloader(
         csv_path=csv_path,
         image_dir=image_dir,
         roi_size=roi_size,
-        split="val",
-        fold=fold,
+        fold=0,
+        split="test_fixed",
         batch_size=batch_size,
         shuffle=False,
         num_workers=num_workers,
-        pin_memory=False,  # Tắt pin_memory để tránh CUDA crash giữa các fold
+        pin_memory=False,
         use_fft=use_fft,
         fft_d0=fft_d0,
         fft_cache_dir=fft_cache_dir,
     )
-
-    return train_loader, val_loader
 
 
 def get_fold_dataset_info(csv_path: str, fold: int, splits=("train", "val", "test")):
     """
     Trả về dict thông tin dataset của 1 fold: số patient, số images per split.
+
+    Auto-detect format:
+    - Long-format: filter split chuẩn (train/val/test)
+    - Wide-format (holdout): chỉ xem fold N là val, các fold khác là train (không có test
+      xoay vòng trong pool)
     """
     df = pd.read_csv(csv_path)
     fold_df = df[df["fold"] == fold].copy()
 
+    has_long_format = (
+        "split" in fold_df.columns
+        and (fold_df["split"] == "val").any()
+    )
+
     info = {"fold": fold}
-    for split in splits:
-        s = fold_df[fold_df["split"] == split]
-        info[f"{split}_patients"] = s["patient_id"].nunique()
-        info[f"{split}_images"] = len(s)
-        if "blood(mg/dL)" in s.columns:
-            labels = s["blood(mg/dL)"].dropna()
-            info[f"{split}_label_mean"] = round(labels.mean(), 2)
-            info[f"{split}_label_std"] = round(labels.std(), 2)
+    if has_long_format:
+        for split in splits:
+            s = fold_df[fold_df["split"] == split]
+            info[f"{split}_patients"] = s["patient_id"].nunique()
+            info[f"{split}_images"] = len(s)
+            if "blood(mg/dL)" in s.columns:
+                labels = s["blood(mg/dL)"].dropna()
+                if len(labels):
+                    info[f"{split}_label_mean"] = round(labels.mean(), 2)
+                    info[f"{split}_label_std"] = round(labels.std(), 2)
+    else:
+        # Wide-format holdout: 2 splits thô — train (khác fold) và val (== fold)
+        pool_df = df[df["fold"].between(1, 10)].copy()
+        train_df = pool_df[pool_df["fold"] != fold]
+        val_df = pool_df[pool_df["fold"] == fold]
+        for split_name, sub in [("train", train_df), ("val", val_df)]:
+            info[f"{split_name}_patients"] = sub["patient_id"].nunique()
+            info[f"{split_name}_images"] = len(sub)
+            if "blood(mg/dL)" in sub.columns and len(sub):
+                labels = sub["blood(mg/dL)"].dropna()
+                info[f"{split_name}_label_mean"] = round(labels.mean(), 2)
+                info[f"{split_name}_label_std"] = round(labels.std(), 2)
 
     return info
 
@@ -357,6 +612,104 @@ def save_roi_for_fold(
     manifest.to_csv(all_manifest_path, index=False)
 
     return fold_df, fold_info
+
+
+def save_roi_for_holdout_fold(
+    csv_path: str,
+    image_dir: str,
+    fold: int,
+    roi_size: int,
+    output_root: str,
+    use_fft: bool = False,
+    fft_d0: float = 30.0,
+):
+    """
+    Wide-format holdout: lưu ROI cho 2 splits (train và val) theo fold N.
+
+    Logic wide-format (split_holdout.csv):
+      - Train: pool_df[fold ∈ {1..10} AND fold != N]  (9 folds khác)
+      - Val:   pool_df[fold == N]                    (1 fold)
+
+    Skip nếu file đã tồn tại (idempotent).
+
+    Cấu trúc:
+        output_root/
+            foldXX_holdout/
+                train/  *.png
+                val/    *.png
+                foldXX_holdout_roi_manifest.csv
+    """
+    from PIL import Image
+    from tqdm import tqdm
+
+    df = pd.read_csv(csv_path)
+    pool_df = df[df["fold"].between(1, 10)].copy()
+
+    train_df = pool_df[pool_df["fold"] != fold].copy()
+    val_df = pool_df[pool_df["fold"] == fold].copy()
+
+    fold_dir = os.path.join(output_root, f"fold{fold:02d}_holdout")
+    saved_rows = []
+
+    splits_data = [("train", train_df), ("val", val_df)]
+    for split_name, sub_df in splits_data:
+        split_dir = os.path.join(fold_dir, split_name)
+        os.makedirs(split_dir, exist_ok=True)
+
+        for _, row in tqdm(sub_df.iterrows(), desc=f"[ROI holdout] fold{fold:02d}/{split_name}", leave=False):
+            img_path = os.path.join(image_dir, row["image_idx"])
+            dst_path = os.path.join(split_dir, os.path.basename(row["image_idx"]))
+
+            if os.path.exists(dst_path):
+                saved_rows.append({
+                    "fold": fold,
+                    "split": split_name,
+                    "image_idx": row["image_idx"],
+                    "roi_path": dst_path,
+                    "label": row.get("blood(mg/dL)", None),
+                })
+                continue
+            if not os.path.exists(img_path):
+                continue
+
+            image = Image.open(img_path).convert("RGB")
+            roi = center_crop_roi(image, roi_size)
+            if use_fft:
+                roi = fft_lowpass_denoise_pil(roi, d0=fft_d0)
+            roi.save(dst_path)
+
+            saved_rows.append({
+                "fold": fold,
+                "split": split_name,
+                "image_idx": row["image_idx"],
+                "roi_path": dst_path,
+                "label": row.get("blood(mg/dL)", None),
+            })
+
+    manifest = pd.DataFrame(saved_rows)
+    manifest_path = os.path.join(fold_dir, f"fold{fold:02d}_holdout_roi_manifest.csv")
+    manifest.to_csv(manifest_path, index=False)
+
+    # Stats trả về giống get_fold_dataset_info
+    info = {
+        "fold": fold,
+        "train_patients": train_df["patient_id"].nunique(),
+        "train_images": len(train_df),
+        "val_patients": val_df["patient_id"].nunique(),
+        "val_images": len(val_df),
+    }
+    if "blood(mg/dL)" in train_df.columns:
+        info["train_label_mean"] = round(train_df["blood(mg/dL)"].mean(), 2)
+        info["train_label_std"] = round(train_df["blood(mg/dL)"].std(), 2)
+        info["val_label_mean"] = round(val_df["blood(mg/dL)"].mean(), 2)
+        info["val_label_std"] = round(val_df["blood(mg/dL)"].std(), 2)
+
+    return fold_df_passthrough(df, fold), info
+
+
+def fold_df_passthrough(df, fold):
+    """Helper: trả về DataFrame của 1 fold (giữ API tương thích)."""
+    return df[df["fold"] == fold].copy()
 
 
 def precompute_fft_cache(
