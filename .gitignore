@@ -4,3 +4,9 @@ checkpoint
 checkpoint_old_v2
 run_all_20260702_122100.log
 logs_batch
+checkpoint_v3
+fft_qc_output
+figures
+inference_results_5images
+inference_results_5images_roi128
+logs
