@@ -1,12 +1,4 @@
-"""1D-CNN Regression model.
 
-Biến ảnh 2D (H, W, C) thành flattened 1D vector, sau đó dùng 1D convolutions
-để học hierarchical patterns từ flattened pixel features.
-So với 2D CNN backbone:
-- 1D convolutions chỉ học local patterns dọc theo flattened sequence.
-- Không có spatial inductive bias (rotation/translation invariance yếu hơn).
-- Phù hợp khi muốn khám phá features không gian theo chiều flattened.
-"""
 import torch
 import torch.nn as nn
 
@@ -145,13 +137,3 @@ class CNN1DRegression(nn.Module):
         return x.squeeze(1)                  # (B,)
 
 
-# ==================== Model Registry ====================
-# Đăng ký vào train.py get_model() bằng tên "cnn1d"
-# =========================================================
-# Ví dụ sử dụng:
-#   model = CNN1DRegression(in_channels=3, pretrained=False, hidden_dims=[512,256,128,64])
-# Hoặc trong train.py thêm:
-#   elif model_name == "cnn1d":
-#       from models.cnn1d import CNN1DRegression
-#       return CNN1DRegression(in_channels=3)
-# =========================================================
