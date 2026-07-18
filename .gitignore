@@ -8,3 +8,5 @@ fft_qc_output
 checkpoint_v3
 logs
 figures
+inference_results_5images
+inference_results_5images_roi128
